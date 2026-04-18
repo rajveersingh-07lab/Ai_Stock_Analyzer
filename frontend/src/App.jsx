@@ -17,7 +17,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const response = await axios.post('http://127.0.0.1:8000/api/analyze', {
+      const response = await axios.post('https://ai-stock-analyzer-6js4.onrender.com/api/analyze', {
         company_name: query,
         enable_agent: true
       });
