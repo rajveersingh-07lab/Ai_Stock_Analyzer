@@ -141,74 +141,83 @@ Provide:
 3. Key Risks (bullet points).
 Format cleanly in Markdown."""
     
-    response = gemini_client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=800)
-    )
-    return response.text
+    try:
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=800)
+        )
+        return response.text
+    except Exception as e:
+        return f"AI error (Check your GEMINI_API_KEY on Render): {str(e)}"
 
 @app.post("/api/analyze")
 def analyze_stock(req: AnalyzeRequest):
-    ticker_sym, full_name = get_ticker(req.company_name)
-    if not ticker_sym:
-        raise HTTPException(status_code=404, detail="Company not found.")
+    try:
+        ticker_sym, full_name = get_ticker(req.company_name)
+        if not ticker_sym:
+            raise HTTPException(status_code=404, detail="Company not found.")
+            
+        stock = yf.Ticker(ticker_sym)
         
-    stock = yf.Ticker(ticker_sym)
-    
-    end_date = datetime.date.today()
-    start_date = end_date - datetime.timedelta(days=365*2)
-    
-    df = yf.download(ticker_sym, start=start_date, end=end_date, auto_adjust=True, progress=False)
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No price data found.")
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=365*2)
         
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        df = yf.download(ticker_sym, start=start_date, end=end_date, auto_adjust=True, progress=False)
+        if df.empty:
+            raise HTTPException(status_code=404, detail="Yahoo Finance returned no price data (rate limit or invalid ticker).")
+            
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        close_s = df['Close']
+        if isinstance(close_s, pd.DataFrame):
+            close_s = close_s.iloc[:, 0]
+            
+        vols = df['Volume']
+        if isinstance(vols, pd.DataFrame):
+            vols = vols.iloc[:, 0]
+            
+        daily_ret = close_s.pct_change()
+        volatility = float(np.std(daily_ret.dropna()) * np.sqrt(252))
+        rsi = calculate_rsi(close_s)
         
-    close_s = df['Close']
-    if isinstance(close_s, pd.DataFrame):
-        close_s = close_s.iloc[:, 0]
+        info = safe_yf_call(lambda: stock.info) or {}
+        current_price = info.get('currentPrice') or float(close_s.iloc[-1])
+        high = info.get('fiftyTwoWeekHigh') or float(close_s.max())
+        low = info.get('fiftyTwoWeekLow') or float(close_s.min())
+        rsi_val = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
         
-    vols = df['Volume']
-    if isinstance(vols, pd.DataFrame):
-        vols = vols.iloc[:, 0]
+        metrics = {
+            'current_price': current_price,
+            'high_52w': high,
+            'low_52w': low,
+            'volatility': volatility,
+            'rsi': rsi_val,
+            'pe': info.get('trailingPE', 'N/A'),
+            'market_cap': info.get('marketCap', 'N/A'),
+        }
         
-    daily_ret = close_s.pct_change()
-    volatility = float(np.std(daily_ret.dropna()) * np.sqrt(252))
-    rsi = calculate_rsi(close_s)
-    
-    info = safe_yf_call(lambda: stock.info) or {}
-    current_price = info.get('currentPrice') or float(close_s.iloc[-1])
-    high = info.get('fiftyTwoWeekHigh') or float(close_s.max())
-    low = info.get('fiftyTwoWeekLow') or float(close_s.min())
-    rsi_val = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
-    
-    metrics = {
-        'current_price': current_price,
-        'high_52w': high,
-        'low_52w': low,
-        'volatility': volatility,
-        'rsi': rsi_val,
-        'pe': info.get('trailingPE', 'N/A'),
-        'market_cap': info.get('marketCap', 'N/A'),
-    }
-    
-    financials = fetch_financial_details(ticker_sym)
-    analysis = get_ai_analysis(ticker_sym, full_name, metrics, financials)
-    
-    chart_data = []
-    prices_subset = close_s.tail(100) # last 100 days
-    for date, price in prices_subset.items():
-        chart_data.append({
-            "date": date.strftime("%Y-%m-%d"),
-            "price": float(price) if not np.isnan(price) else 0.0
-        })
+        financials = fetch_financial_details(ticker_sym)
+        analysis = get_ai_analysis(ticker_sym, full_name, metrics, financials)
+        
+        chart_data = []
+        prices_subset = close_s.tail(100) # last 100 days
+        for date, price in prices_subset.items():
+            chart_data.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "price": float(price) if not np.isnan(price) else 0.0
+            })
 
-    return {
-        "symbol": ticker_sym,
-        "name": full_name,
-        "metrics": metrics,
-        "analysis": analysis,
-        "chart_data": chart_data
-    }
+        return {
+            "symbol": ticker_sym,
+            "name": full_name,
+            "metrics": metrics,
+            "analysis": analysis,
+            "chart_data": chart_data
+        }
+    except Exception as e:
+        import traceback
+        error_msg = f"Crash inside backend logic: {str(e)}\n\nTrace: {traceback.format_exc()}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=str(e))
